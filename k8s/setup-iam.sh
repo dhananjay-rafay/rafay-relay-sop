@@ -100,12 +100,6 @@ print_status "Namespace: $NAMESPACE"
 print_status "Service Account: $SERVICE_ACCOUNT"
 print_status "IAM Role: $ROLE_NAME"
 
-# Check if eksctl is installed
-if ! command -v eksctl &> /dev/null; then
-    print_error "eksctl is not installed. Please install eksctl first."
-    exit 1
-fi
-
 # Check if kubectl is installed
 if ! command -v kubectl &> /dev/null; then
     print_error "kubectl is not installed. Please install kubectl first."
@@ -118,17 +112,13 @@ if ! command -v aws &> /dev/null; then
     exit 1
 fi
 
-# Step 1: Enable OIDC provider for the cluster
-print_status "Step 1: Enabling OIDC provider for the cluster..."
-eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME --region $REGION --approve
-
-# Step 2: Get the OIDC provider ID
-print_status "Step 2: Getting OIDC provider ID..."
+# Step 1: Get the OIDC provider ID
+print_status "Step 1: Getting OIDC provider ID..."
 OIDC_PROVIDER=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
 print_status "OIDC Provider ID: $OIDC_PROVIDER"
 
-# Step 3: Create IAM policy
-print_status "Step 3: Creating IAM policy..."
+# Step 2: Create IAM policy
+print_status "Step 2: Creating IAM policy..."
 POLICY_ARN=$(aws iam create-policy \
     --policy-name ${ROLE_NAME}-policy \
     --policy-document file://k8s/iam-policy.json \
@@ -137,8 +127,8 @@ POLICY_ARN=$(aws iam create-policy \
     aws iam get-policy --policy-arn arn:aws:iam::${ACCOUNT_ID}:policy/${ROLE_NAME}-policy --query 'Policy.Arn' --output text)
 print_status "Policy ARN: $POLICY_ARN"
 
-# Step 4: Create IAM role with trust policy
-print_status "Step 4: Creating IAM role..."
+# Step 3: Create IAM role with trust policy
+print_status "Step 3: Creating IAM role..."
 # Update trust policy with actual values
 sed "s/ACCOUNT_ID/$ACCOUNT_ID/g; s/REGION/$REGION/g; s/EXAMPLED539D4633E53DE1B71EXAMPLE/$OIDC_PROVIDER/g; s/rafay-core/$NAMESPACE/g; s/rafay-relay-sop-sa/$SERVICE_ACCOUNT/g" \
     k8s/iam-trust-policy.json > /tmp/trust-policy.json
@@ -149,18 +139,18 @@ aws iam create-role \
     --query 'Role.Arn' \
     --output text 2>/dev/null || print_warning "Role already exists"
 
-# Step 5: Attach policy to role
-print_status "Step 5: Attaching policy to role..."
+# Step 4: Attach policy to role
+print_status "Step 4: Attaching policy to role..."
 aws iam attach-role-policy \
     --role-name $ROLE_NAME \
     --policy-arn $POLICY_ARN
 
-# Step 6: Create namespace if it doesn't exist
-print_status "Step 6: Creating namespace if it doesn't exist..."
+# Step 5: Create namespace if it doesn't exist
+print_status "Step 5: Creating namespace if it doesn't exist..."
 kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 
-# Step 7: Update deployment with correct role ARN
-print_status "Step 7: Updating deployment with IAM role ARN..."
+# Step 6: Update deployment with correct role ARN
+print_status "Step 6: Updating deployment with IAM role ARN..."
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 sed "s/ACCOUNT_ID/$ACCOUNT_ID/g; s/rafay-relay-sop-role/$ROLE_NAME/g" \
     k8s/deployment.yaml > /tmp/deployment-with-role.yaml

@@ -80,8 +80,8 @@ curl -XGET http://rafay-relay-sop.rafaycore:8080/health
 - AWS credentials configured (via IAM roles or environment variables)
 - kubectl access to the cluster
 - Rafay Relay deployment running in `rafay-core` namespace
-- eksctl (for IAM role setup)
 - AWS CLI configured with appropriate permissions
+- OIDC provider already enabled for the EKS cluster
 
 ## Installation
 
@@ -123,18 +123,21 @@ make deploy-with-iam ACCOUNT_ID=123456789012
 #### Option B: Manual Setup
 
 ```bash
-# 1. Enable OIDC provider for your cluster
-eksctl utils associate-iam-oidc-provider --cluster your-cluster-name --region us-west-2 --approve
+# 1. Get OIDC provider ID (assuming OIDC is already enabled)
+OIDC_PROVIDER=$(aws eks describe-cluster --name your-cluster-name --region us-west-2 --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
 
 # 2. Create IAM policy
 aws iam create-policy \
     --policy-name rafay-relay-sop-role-policy \
     --policy-document file://k8s/iam-policy.json
 
-# 3. Create IAM role with trust policy
+# 3. Create IAM role with trust policy (update OIDC provider ID)
+sed "s/ACCOUNT_ID/123456789012/g; s/REGION/us-west-2/g; s/EXAMPLED539D4633E53DE1B71EXAMPLE/$OIDC_PROVIDER/g" \
+    k8s/iam-trust-policy.json > /tmp/trust-policy.json
+
 aws iam create-role \
     --role-name rafay-relay-sop-role \
-    --assume-role-policy-document file://k8s/iam-trust-policy.json
+    --assume-role-policy-document file:///tmp/trust-policy.json
 
 # 4. Attach policy to role
 aws iam attach-role-policy \

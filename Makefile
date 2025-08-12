@@ -52,9 +52,10 @@ docker-buildx-push:
 docker-push:
 	docker push $(DOCKER_IMAGE):$(DOCKER_TAG)
 
-# Setup IAM role for service account
+# Setup IAM role for service account (OIDC provider must be already enabled)
 setup-iam:
 	@echo "Setting up IAM role for service account..."
+	@echo "Note: OIDC provider must be already enabled for the cluster"
 	@echo "Usage: make setup-iam CLUSTER_NAME=<cluster> REGION=<region> ACCOUNT_ID=<account>"
 	@echo "Example: make setup-iam CLUSTER_NAME=my-cluster REGION=us-west-2 ACCOUNT_ID=123456789012"
 	@if [ -z "$(CLUSTER_NAME)" ] || [ -z "$(REGION)" ] || [ -z "$(ACCOUNT_ID)" ]; then \

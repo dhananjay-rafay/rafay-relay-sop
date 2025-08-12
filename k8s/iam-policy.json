@@ -10,7 +10,11 @@
                 "eks:DescribeNodegroup",
                 "eks:ListTagsForResource"
             ],
-            "Resource": "*"
+            "Resource": [
+                "*",
+                "arn:aws:eks:us-east-1:679196758854:cluster/upgrade-tb",
+                "arn:aws:eks:us-east-1:679196758854:nodegroup/upgrade-tb/*"
+            ]
         },
         {
             "Effect": "Allow",

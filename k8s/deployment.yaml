@@ -77,8 +77,8 @@ metadata:
   name: rafay-relay-sop-config
   namespace: rafay-core
 data:
-  aws-region: "us-west-2"
-  eks-cluster: "rafay-cluster"
+  aws-region: "us-east-1"
+  eks-cluster: "upgrade-tb"
 ---
 apiVersion: v1
 kind: ServiceAccount

@@ -1,0 +1,45 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "eks:ListClusters",
+                "eks:DescribeCluster",
+                "eks:ListNodegroups",
+                "eks:DescribeNodegroup",
+                "eks:ListTagsForResource"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "autoscaling:DescribeAutoScalingGroups",
+                "autoscaling:DescribeAutoScalingInstances",
+                "autoscaling:UpdateAutoScalingGroup",
+                "autoscaling:SetInstanceProtection",
+                "autoscaling:DescribeLaunchConfigurations"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceStatus",
+                "ec2:DescribeInstanceAttribute",
+                "ec2:DescribeTags"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:GetRole",
+                "iam:PassRole"
+            ],
+            "Resource": "arn:aws:iam::*:role/eks-nodegroup-*"
+        }
+    ]
+}

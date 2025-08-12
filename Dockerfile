@@ -42,12 +42,22 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     chmod +x kubectl && \
     mv kubectl /usr/local/bin/
 
-# Install AWS CLI v2
+# Install AWS CLI v2 for the target architecture
+ARG TARGETARCH
 RUN apk add --no-cache \
-    python3 \
-    py3-pip \
-    && pip3 install --upgrade pip \
-    && pip3 install --no-cache-dir awscli \
+    curl \
+    unzip \
+    && if [ "$TARGETARCH" = "amd64" ]; then \
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"; \
+    else \
+    echo "Unsupported architecture: $TARGETARCH"; \
+    exit 1; \
+    fi \
+    && unzip awscliv2.zip \
+    && ./aws/install \
+    && rm -rf awscliv2.zip aws \
     && rm -rf /var/cache/apk/*
 
 # Create non-root user

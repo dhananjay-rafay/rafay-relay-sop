@@ -18,8 +18,8 @@ spec:
       serviceAccountName: rafay-relay-sop-sa
       containers:
         - name: rafay-relay-sop
-          image: rafay-relay-sop:latest
-          imagePullPolicy: IfNotPresent
+          image: registry.dev.rafay-edge.net/dhananjay/rafay-relay-sop:v1.0.0-1
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
               name: http
@@ -86,7 +86,7 @@ metadata:
   name: rafay-relay-sop-sa
   namespace: rafay-core
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/rafay-relay-sop-role
+    eks.amazonaws.com/role-arn: arn:aws:iam::679196758854:role/rafay-relay-sop-role
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

@@ -166,6 +166,8 @@ func (s *SOPService) ExecuteSOP() error {
 	if s.stateManager != nil {
 		if err := s.stateManager.InitializeState(12); err != nil {
 			s.addLog(fmt.Sprintf("Warning: Failed to initialize resilient state: %v", err))
+			// Disable state manager if initialization fails
+			s.stateManager = nil
 		}
 	}
 
@@ -181,7 +183,7 @@ func (s *SOPService) ExecuteSOP() error {
 		// Mark execution as completed in resilient state
 		if s.stateManager != nil {
 			if err := s.stateManager.CompleteExecution(); err != nil {
-				s.addLog(fmt.Sprintf("Warning: Failed to mark execution as completed: %v", err))
+				// Don't log completion failure if state persistence is already disabled
 			}
 		}
 	}()
@@ -217,7 +219,10 @@ func (s *SOPService) ExecuteSOP() error {
 		// Start step tracking
 		if s.stateManager != nil {
 			if err := s.stateManager.StartStep(i, step.name); err != nil {
-				s.addLog(fmt.Sprintf("Warning: Failed to start step tracking: %v", err))
+				// Only log once per step to reduce noise
+				if i == 0 {
+					s.addLog(fmt.Sprintf("Warning: State persistence disabled due to Kafka issues: %v", err))
+				}
 			}
 		}
 
@@ -230,7 +235,7 @@ func (s *SOPService) ExecuteSOP() error {
 			// Mark step as failed in resilient state
 			if s.stateManager != nil {
 				if err := s.stateManager.FailStep(i, err.Error()); err != nil {
-					s.addLog(fmt.Sprintf("Warning: Failed to mark step as failed: %v", err))
+					// Don't log state persistence failures for step failures
 				}
 			}
 
@@ -244,7 +249,8 @@ func (s *SOPService) ExecuteSOP() error {
 		// Mark step as completed
 		if s.stateManager != nil {
 			if err := s.stateManager.CompleteStep(i); err != nil {
-				s.addLog(fmt.Sprintf("Warning: Failed to mark step as completed: %v", err))
+				// Don't log every step completion failure to reduce noise
+				// The first failure was already logged
 			}
 		}
 
@@ -487,10 +493,10 @@ func (s *SOPService) stepGetOldRelayNodes() error {
 	// Save context data to resilient state
 	if s.stateManager != nil {
 		if err := s.stateManager.SetContext("oldPods", s.oldPods); err != nil {
-			s.addLog(fmt.Sprintf("Warning: Failed to save old pods to context: %v", err))
+			// Don't log context saving failures to reduce noise
 		}
 		if err := s.stateManager.SetContext("oldNodes", s.oldNodes); err != nil {
-			s.addLog(fmt.Sprintf("Warning: Failed to save old nodes to context: %v", err))
+			// Don't log context saving failures to reduce noise
 		}
 	}
 

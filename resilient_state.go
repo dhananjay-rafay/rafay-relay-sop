@@ -67,6 +67,12 @@ func NewResilientStateManager(kafkaBrokers []string, topic string) (*ResilientSt
 		return nil, fmt.Errorf("failed to create Kafka consumer: %v", err)
 	}
 
+	// Create topic if it doesn't exist
+	if err := createTopicIfNotExists(kafkaBrokers, topic); err != nil {
+		// Log warning but don't fail - topic will be auto-created by Kafka
+		logrus.Warnf("Failed to create topic %s: %v (will be auto-created)", topic, err)
+	}
+
 	return &ResilientStateManager{
 		producer:    producer,
 		consumer:    consumer,
@@ -74,6 +80,44 @@ func NewResilientStateManager(kafkaBrokers []string, topic string) (*ResilientSt
 		executionID: uuid.New().String(),
 		logger:      logrus.New(),
 	}, nil
+}
+
+// createTopicIfNotExists creates a Kafka topic if it doesn't exist
+func createTopicIfNotExists(brokers []string, topic string) error {
+	config := sarama.NewConfig()
+	config.Version = sarama.V2_8_0_0
+	config.Net.TLS.Enable = false
+	config.Net.SASL.Enable = false
+
+	admin, err := sarama.NewClusterAdmin(brokers, config)
+	if err != nil {
+		return fmt.Errorf("failed to create cluster admin: %v", err)
+	}
+	defer admin.Close()
+
+	// Check if topic exists
+	topics, err := admin.ListTopics()
+	if err != nil {
+		return fmt.Errorf("failed to list topics: %v", err)
+	}
+
+	if _, exists := topics[topic]; exists {
+		return nil // Topic already exists
+	}
+
+	// Create topic
+	topicDetail := &sarama.TopicDetail{
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	}
+
+	err = admin.CreateTopic(topic, topicDetail, false)
+	if err != nil {
+		return fmt.Errorf("failed to create topic %s: %v", topic, err)
+	}
+
+	logrus.Infof("Created Kafka topic: %s", topic)
+	return nil
 }
 
 // InitializeState initializes a new SOP execution state
@@ -246,6 +290,13 @@ func (rsm *ResilientStateManager) persistState() error {
 
 	partition, offset, err := rsm.producer.SendMessage(msg)
 	if err != nil {
+		// Check if it's a topic not found error
+		if saramaErr, ok := err.(sarama.ProducerError); ok {
+			if saramaErr.Err == sarama.ErrUnknownTopicOrPartition {
+				rsm.logger.Warnf("Kafka topic %s does not exist, state persistence disabled", rsm.topic)
+				return fmt.Errorf("topic not found: %s", rsm.topic)
+			}
+		}
 		return fmt.Errorf("failed to send message to Kafka: %v", err)
 	}
 

@@ -18,7 +18,7 @@ spec:
       serviceAccountName: rafay-relay-sop-sa
       containers:
         - name: rafay-relay-sop
-          image: registry.dev.rafay-edge.net/dhananjay/rafay-relay-sop:v1.0.0-1
+          image: registry.dev.rafay-edge.net/dhananjay/rafay-relay-sop:v1.0.0-2
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

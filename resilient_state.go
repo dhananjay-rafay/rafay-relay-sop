@@ -52,9 +52,9 @@ func NewResilientStateManager(kafkaBrokers []string, topic string) (*ResilientSt
 	config.Producer.Retry.Max = 5
 	config.Producer.Return.Successes = true
 	config.Version = sarama.V2_8_0_0
-	
+
 	// Configure for managed Kafka (MSK)
-	config.Net.TLS.Enable = false // Set to true if your managed Kafka requires TLS
+	config.Net.TLS.Enable = false  // Set to true if your managed Kafka requires TLS
 	config.Net.SASL.Enable = false // Set to true if your managed Kafka requires SASL
 
 	producer, err := sarama.NewSyncProducer(kafkaBrokers, config)
@@ -262,11 +262,13 @@ func (rsm *ResilientStateManager) persistState() error {
 
 // Close closes the Kafka connections
 func (rsm *ResilientStateManager) Close() error {
+	rsm.logger.Info("Closing Kafka connections...")
 	if err := rsm.producer.Close(); err != nil {
-		return fmt.Errorf("failed to close producer: %v", err)
+		rsm.logger.Warnf("Failed to close producer: %v", err)
 	}
 	if err := rsm.consumer.Close(); err != nil {
-		return fmt.Errorf("failed to close consumer: %v", err)
+		rsm.logger.Warnf("Failed to close consumer: %v", err)
 	}
+	rsm.logger.Info("Kafka connections closed")
 	return nil
 }

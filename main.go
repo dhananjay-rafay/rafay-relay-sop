@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ func main() {
 	router := mux.NewRouter()
 	router.HandleFunc("/run", handleRun).Methods("GET")
 	router.HandleFunc("/status", handleStatus).Methods("GET")
+	router.HandleFunc("/clear", handleClear).Methods("GET")
 	router.HandleFunc("/health", handleHealth).Methods("GET")
 
 	// Setup server
@@ -74,6 +76,23 @@ func main() {
 func handleRun(w http.ResponseWriter, r *http.Request) {
 	logger.Info("Received /run request")
 
+	// Check if there's a completed execution first
+	if sopService.stateManager != nil {
+		if existingState, err := sopService.stateManager.LoadExistingState(); err == nil && existingState != nil {
+			if existingState.Status == "Completed" {
+				response := map[string]interface{}{
+					"status":  "skipped",
+					"message": "Previous execution completed successfully. Use /clear to start fresh.",
+					"time":    time.Now().UTC(),
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(response)
+				return
+			}
+		}
+	}
+
 	response := map[string]interface{}{
 		"status":  "started",
 		"message": "SOP execution started",
@@ -87,7 +106,12 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 	// Start SOP execution in background
 	go func() {
 		if err := sopService.ExecuteSOP(); err != nil {
-			logger.Errorf("SOP execution failed: %v", err)
+			// Check if this is a "completed execution" error (not a real failure)
+			if strings.Contains(err.Error(), "previous execution completed successfully") {
+				logger.Infof("SOP execution skipped: %v", err)
+			} else {
+				logger.Errorf("SOP execution failed: %v", err)
+			}
 		} else {
 			logger.Info("SOP execution completed successfully")
 		}
@@ -108,4 +132,22 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+}
+
+func handleClear(w http.ResponseWriter, r *http.Request) {
+	logger.Info("Received /clear request")
+
+	if sopService.stateManager != nil {
+		if err := sopService.stateManager.ClearOldState(); err != nil {
+			logger.Errorf("Failed to clear state: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to clear state"})
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "State cleared successfully"})
 }

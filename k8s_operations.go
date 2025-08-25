@@ -178,3 +178,61 @@ type PodInfo struct {
 	Name      string
 	Node      string
 }
+
+func (k *K8SOperations) GetNodeToInstanceMapping() (map[string]string, error) {
+	// Get all nodes with their provider IDs and add debug logging
+	cmd := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\t'}{.spec.providerID}{'\\n'}{end}")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get nodes with provider IDs: %v", err)
+	}
+
+	nodeToInstanceMap := make(map[string]string)
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+
+	// Debug: Log the raw output
+	fmt.Printf("DEBUG: Raw kubectl output: %s\n", string(output))
+	fmt.Printf("DEBUG: Found %d lines\n", len(lines))
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) == 2 {
+			nodeName := parts[0]
+			providerID := parts[1]
+
+			// Debug logging
+			fmt.Printf("DEBUG: Node %s has provider ID: %s\n", nodeName, providerID)
+
+			// Extract instance ID from provider ID (format: aws:///us-east-1a/i-1234567890abcdef0)
+			if strings.Contains(providerID, "aws://") {
+				// Handle the double slash format: aws:///us-east-1a/i-1234567890abcdef0
+				// Split by "/" and look for the last segment that starts with "i-"
+				segments := strings.Split(providerID, "/")
+				var instanceID string
+				for i := len(segments) - 1; i >= 0; i-- {
+					if strings.HasPrefix(segments[i], "i-") {
+						instanceID = segments[i]
+						break
+					}
+				}
+
+				if instanceID != "" {
+					nodeToInstanceMap[nodeName] = instanceID
+					fmt.Printf("DEBUG: Mapped node %s to instance %s\n", nodeName, instanceID)
+				} else {
+					fmt.Printf("DEBUG: No instance ID found in provider ID: %s\n", providerID)
+				}
+			} else {
+				fmt.Printf("DEBUG: Provider ID doesn't contain 'aws://': %s\n", providerID)
+			}
+		} else {
+			fmt.Printf("DEBUG: Invalid line format: %s (parts: %d)\n", line, len(parts))
+		}
+	}
+
+	fmt.Printf("DEBUG: Final mapping: %v\n", nodeToInstanceMap)
+	return nodeToInstanceMap, nil
+}

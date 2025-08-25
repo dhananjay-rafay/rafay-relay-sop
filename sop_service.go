@@ -146,9 +146,31 @@ func (s *SOPService) ExecuteSOP() error {
 	// Check for existing state and attempt recovery
 	if s.stateManager != nil {
 		if existingState, err := s.stateManager.LoadExistingState(); err == nil && existingState != nil {
+			s.addLog(fmt.Sprintf("Found existing execution state: %s (status: %s, step: %d)",
+				existingState.ExecutionID, existingState.Status, existingState.CurrentStep))
+
 			if existingState.Status == "Running" || existingState.Status == "Resuming" {
-				s.addLog(fmt.Sprintf("Found existing execution state: %s, attempting recovery", existingState.ExecutionID))
+				s.addLog("Attempting to resume execution from previous state")
 				return s.resumeExecution(existingState)
+			} else if existingState.Status == "Completed" {
+				s.addLog("Previous execution was completed successfully")
+				s.addLog("To start a new execution, clear the state first using /clear endpoint")
+				// Restore the completed state for status reporting
+				s.mu.Lock()
+				s.status = SOPStatus{
+					Status:    "Success",
+					StartTime: existingState.StartTime,
+					EndTime:   &existingState.LastUpdateTime,
+					Logs:      []string{fmt.Sprintf("Execution completed successfully at %s", existingState.LastUpdateTime.Format(time.RFC3339))},
+				}
+				s.mu.Unlock()
+				return fmt.Errorf("previous execution completed successfully - use /clear to start fresh") // Return error to indicate no new execution
+			} else if existingState.Status == "Failed" {
+				s.addLog("Previous execution failed, starting fresh execution")
+				// Clear the failed state and start fresh
+				if err := s.stateManager.ClearOldState(); err != nil {
+					s.addLog(fmt.Sprintf("Warning: Failed to clear old state: %v", err))
+				}
 			}
 		}
 	}
@@ -721,12 +743,29 @@ func (s *SOPService) stepAddScaleInProtections() error {
 		return fmt.Errorf("failed to get ASG for nodegroup: %v", err)
 	}
 
+	// Get all instances in the ASG for validation
+	_, err = s.awsOps.GetASGInstances(*asgName)
+	if err != nil {
+		return fmt.Errorf("failed to get ASG instances: %v", err)
+	}
+
+	// Get node-to-instance mapping by matching private IPs
+	s.addLog("Getting node-to-instance mapping...")
+	nodeToInstanceMap, err := s.k8sOps.GetNodeToInstanceMapping()
+	if err != nil {
+		return fmt.Errorf("failed to get node-to-instance mapping: %v", err)
+	}
+	s.addLog(fmt.Sprintf("Node-to-instance mapping: %v", nodeToInstanceMap))
+
 	// Find instances that correspond to nodes with relay pods
 	var instancesToProtect []string
 	for nodeName := range nodeMap {
-		// This is a simplified mapping - in practice you'd need to get the node's IP
-		// and match it with instance private IPs
-		s.addLog(fmt.Sprintf("Node %s has relay pods - will protect corresponding instance", nodeName))
+		if instanceId, exists := nodeToInstanceMap[nodeName]; exists {
+			instancesToProtect = append(instancesToProtect, instanceId)
+			s.addLog(fmt.Sprintf("Node %s maps to instance %s - will protect", nodeName, instanceId))
+		} else {
+			s.addLog(fmt.Sprintf("Warning: Could not find instance ID for node %s", nodeName))
+		}
 	}
 
 	// Add protection to instances
@@ -735,7 +774,9 @@ func (s *SOPService) stepAddScaleInProtections() error {
 		if err != nil {
 			return fmt.Errorf("failed to add scale in protections: %v", err)
 		}
-		s.addLog(fmt.Sprintf("Added scale in protection to %d instances", len(instancesToProtect)))
+		s.addLog(fmt.Sprintf("Added scale in protection to %d instances: %v", len(instancesToProtect), instancesToProtect))
+	} else {
+		s.addLog("Warning: No instances found to protect")
 	}
 
 	return nil

@@ -122,6 +122,9 @@ func createTopicIfNotExists(brokers []string, topic string) error {
 
 // InitializeState initializes a new SOP execution state
 func (rsm *ResilientStateManager) InitializeState(totalSteps int) error {
+	// Generate a new execution ID for fresh execution
+	rsm.executionID = uuid.New().String()
+
 	rsm.state = &SOPExecutionState{
 		ExecutionID:    rsm.executionID,
 		Status:         "Running",
@@ -142,29 +145,46 @@ func (rsm *ResilientStateManager) InitializeState(totalSteps int) error {
 		}
 	}
 
+	rsm.logger.Infof("Initialized new execution state: %s", rsm.executionID)
 	return rsm.persistState()
 }
 
 // LoadExistingState attempts to load existing state for recovery
 func (rsm *ResilientStateManager) LoadExistingState() (*SOPExecutionState, error) {
-	partitionConsumer, err := rsm.consumer.ConsumePartition(rsm.topic, 0, sarama.OffsetNewest)
+	partitionConsumer, err := rsm.consumer.ConsumePartition(rsm.topic, 0, sarama.OffsetOldest)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create partition consumer: %v", err)
 	}
 	defer partitionConsumer.Close()
 
-	// Get the latest message
-	select {
-	case msg := <-partitionConsumer.Messages():
-		var state SOPExecutionState
-		if err := json.Unmarshal(msg.Value, &state); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal state: %v", err)
+	var latestState *SOPExecutionState
+	timeout := time.After(10 * time.Second)
+
+	// Read all messages to find the latest execution state
+	for {
+		select {
+		case msg := <-partitionConsumer.Messages():
+			var state SOPExecutionState
+			if err := json.Unmarshal(msg.Value, &state); err != nil {
+				rsm.logger.Warnf("Failed to unmarshal state message: %v", err)
+				continue
+			}
+
+			// Keep track of the latest state
+			if latestState == nil || state.LastUpdateTime.After(latestState.LastUpdateTime) {
+				latestState = &state
+			}
+
+		case <-timeout:
+			if latestState != nil {
+				rsm.logger.Infof("Found existing execution state: %s (status: %s, step: %d)",
+					latestState.ExecutionID, latestState.Status, latestState.CurrentStep)
+				rsm.state = latestState
+				rsm.executionID = latestState.ExecutionID
+				return latestState, nil
+			}
+			return nil, nil // No existing state found
 		}
-		rsm.state = &state
-		rsm.executionID = state.ExecutionID
-		return &state, nil
-	case <-time.After(5 * time.Second):
-		return nil, nil // No existing state found
 	}
 }
 
@@ -268,6 +288,14 @@ func (rsm *ResilientStateManager) GetContext(key string) interface{} {
 	}
 
 	return rsm.state.Context[key]
+}
+
+// ClearOldState clears the current state and starts fresh
+func (rsm *ResilientStateManager) ClearOldState() error {
+	rsm.logger.Info("Clearing old execution state")
+	rsm.state = nil
+	rsm.executionID = uuid.New().String()
+	return nil
 }
 
 // persistState saves the current state to Kafka

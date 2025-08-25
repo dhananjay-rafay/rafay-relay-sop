@@ -199,16 +199,21 @@ func (a *AWSOperations) RemoveScaleInProtections(asgName string) error {
 
 func (a *AWSOperations) AddScaleInProtections(asgName string, instanceIds []string) error {
 	for _, instanceId := range instanceIds {
+		// Add debug logging
+		logrus.Infof("Adding scale-in protection for instance %s in ASG %s", instanceId, asgName)
+
 		cmd := exec.Command("aws", "autoscaling", "set-instance-protection",
 			"--auto-scaling-group-name", asgName,
 			"--instance-ids", instanceId,
-			"--protected-from-scale-in", "true",
+			"--protected-from-scale-in",
 			"--region", a.region)
 
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to add scale in protection for instance %s: %v, output: %s", instanceId, err, string(output))
 		}
+
+		logrus.Infof("Successfully added scale-in protection for instance %s", instanceId)
 	}
 
 	return nil

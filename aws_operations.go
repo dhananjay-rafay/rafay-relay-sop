@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/sirupsen/logrus"
 )
 
 type AWSOperations struct {
@@ -33,6 +34,10 @@ func (a *AWSOperations) FindNodeGroup(clusterName, nodeGroupLabel string) (*stri
 	input := &eks.ListNodegroupsInput{
 		ClusterName: aws.String(clusterName),
 	}
+
+	// Add debug logging for network connectivity
+	logrus.Infof("Attempting to connect to EKS API for cluster: %s", clusterName)
+	logrus.Infof("EKS API endpoint: https://eks.%s.amazonaws.com", a.region)
 
 	result, err := a.eksClient.ListNodegroups(context.TODO(), input)
 	if err != nil {

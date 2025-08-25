@@ -13,7 +13,8 @@ spec:
   template:
     metadata:
       annotations:
-        traffic.sidecar.istio.io/excludeOutboundPorts: "9092"
+        traffic.sidecar.istio.io/excludeOutboundPorts: "9092,443"
+        traffic.sidecar.istio.io/excludeOutboundHosts: "eks.us-east-1.amazonaws.com,*.eks.us-east-1.amazonaws.com"
       labels:
         app: rafay-relay-sop
     spec:

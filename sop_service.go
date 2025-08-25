@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -68,7 +70,14 @@ func NewSOPService() (*SOPService, error) {
 		return nil, fmt.Errorf("failed to create k8s client: %v", err)
 	}
 
-	// Initialize AWS clients
+	// Ensure the original AWS config has the correct region
+	awsCfg.Region = cfg.AWSRegion
+
+	// Log the configuration for debugging
+	logrus.Infof("AWS Region from config: %s", cfg.AWSRegion)
+	logrus.Infof("AWS Config Region: %s", awsCfg.Region)
+
+	// Initialize AWS clients with the modified config
 	eksClient := eks.NewFromConfig(awsCfg)
 	asgClient := autoscaling.NewFromConfig(awsCfg)
 	ec2Client := ec2.NewFromConfig(awsCfg)
@@ -98,8 +107,8 @@ func loadConfigFromConfigMap() (*Config, error) {
 	// This would typically load from a configmap
 	// For now, we'll use environment variables or defaults
 	return &Config{
-		AWSRegion:  getEnvOrDefault("AWS_REGION", "us-west-2"),
-		EKSCluster: getEnvOrDefault("EKS_CLUSTER", "rafay-cluster"),
+		AWSRegion:  getEnvOrDefault("AWS_REGION", "us-east-1"),
+		EKSCluster: getEnvOrDefault("EKS_CLUSTER", "upgrade-tb"),
 		Namespace:  "rafay-core",
 		NodeGroup:  "nodegroup-relay-services",
 		Deployment: "rafay-relay",
@@ -114,9 +123,8 @@ func getEnvOrDefault(key, defaultValue string) string {
 }
 
 func getEnv(key string) string {
-	// This would be implemented to read from configmap
-	// For now, return empty string
-	return ""
+	// Read environment variables from ConfigMap
+	return os.Getenv(key)
 }
 
 func (s *SOPService) ExecuteSOP() error {
@@ -145,6 +153,7 @@ func (s *SOPService) ExecuteSOP() error {
 		{"Get AWS region and EKS cluster from configmap", s.stepGetConfig},
 		{"Find nodegroup with label Name=nodegroup-relay-services and nodecount >1", s.stepFindNodeGroup},
 		{"Scale nodegroup to 2X current count", s.stepScaleNodeGroup},
+		{"Check ASG scaling status", s.stepCheckASGStatus},
 		{"Verify nodes are showing up", s.stepVerifyNodes},
 		{"Rollout restart rafay-sentry", s.stepRestartSentry},
 		{"Get list of nodes with relay pods", s.stepGetRelayNodes},
@@ -187,6 +196,23 @@ func (s *SOPService) stepFindNodeGroup() error {
 	}
 
 	s.addLog(fmt.Sprintf("Found nodegroup: %s", *nodeGroupName))
+
+	// Get current nodegroup details
+	asgName, err := s.awsOps.GetNodeGroupASG(s.config.EKSCluster, *nodeGroupName)
+	if err != nil {
+		s.addLog(fmt.Sprintf("Warning: Could not get ASG for nodegroup: %v", err))
+	} else {
+		s.addLog(fmt.Sprintf("Nodegroup ASG: %s", *asgName))
+
+		// Get current instance count
+		instances, err := s.awsOps.GetASGInstances(*asgName)
+		if err != nil {
+			s.addLog(fmt.Sprintf("Warning: Could not get ASG instances: %v", err))
+		} else {
+			s.addLog(fmt.Sprintf("Current ASG instances (%d): %v", len(instances), instances))
+		}
+	}
+
 	return nil
 }
 
@@ -214,6 +240,7 @@ func (s *SOPService) stepScaleNodeGroup() error {
 	currentCount := int32(len(instances))
 	targetCount := currentCount * 2
 
+	s.addLog(fmt.Sprintf("Current ASG instances: %v", instances))
 	s.addLog(fmt.Sprintf("Scaling ASG %s from %d to %d instances", *asgName, currentCount, targetCount))
 
 	// Scale the ASG
@@ -222,10 +249,48 @@ func (s *SOPService) stepScaleNodeGroup() error {
 		return fmt.Errorf("failed to scale nodegroup: %v", err)
 	}
 
+	s.addLog(fmt.Sprintf("Successfully initiated scaling of ASG %s to %d instances", *asgName, targetCount))
+	s.addLog("Note: Scaling may take several minutes to complete")
+
+	return nil
+}
+
+func (s *SOPService) stepCheckASGStatus() error {
+	s.addLog("Checking ASG scaling status")
+
+	// Find the nodegroup first
+	nodeGroupName, err := s.awsOps.FindNodeGroup(s.config.EKSCluster, s.config.NodeGroup)
+	if err != nil {
+		return fmt.Errorf("failed to find nodegroup: %v", err)
+	}
+
+	// Get the ASG name
+	asgName, err := s.awsOps.GetNodeGroupASG(s.config.EKSCluster, *nodeGroupName)
+	if err != nil {
+		return fmt.Errorf("failed to get ASG for nodegroup: %v", err)
+	}
+
+	// Get current instance count
+	instances, err := s.awsOps.GetASGInstances(*asgName)
+	if err != nil {
+		return fmt.Errorf("failed to get ASG instances: %v", err)
+	}
+
+	s.addLog(fmt.Sprintf("ASG %s current instances (%d): %v", *asgName, len(instances), instances))
+
+	// Check if scaling is still in progress
+	if len(instances) < 2 {
+		s.addLog("Warning: ASG scaling may still be in progress. Expected more instances.")
+	} else {
+		s.addLog("ASG scaling appears to be complete")
+	}
+
 	return nil
 }
 
 func (s *SOPService) stepVerifyNodes() error {
+	s.addLog("Verifying nodes are showing up")
+
 	nodes, err := s.k8sOps.GetNodesWithLabel("Name")
 	if err != nil {
 		return fmt.Errorf("failed to get nodes: %v", err)
@@ -235,19 +300,41 @@ func (s *SOPService) stepVerifyNodes() error {
 	for _, node := range nodes {
 		s.addLog(fmt.Sprintf("  - %s", node))
 	}
+
+	// Also check all nodes to see the total count
+	allNodes, err := s.k8sOps.GetAllNodes()
+	if err != nil {
+		s.addLog(fmt.Sprintf("Warning: Could not get all nodes: %v", err))
+	} else {
+		s.addLog(fmt.Sprintf("Total nodes in cluster: %d", len(allNodes)))
+	}
+
 	return nil
 }
 
 func (s *SOPService) stepRestartSentry() error {
-	err := s.k8sOps.RestartDeployment("rafay-sentry")
+	s.addLog("Rollout restart rafay-sentry")
+
+	// Check current status before restart
+	replicas, err := s.k8sOps.GetDeploymentReplicas("rafay-sentry")
+	if err != nil {
+		s.addLog(fmt.Sprintf("Warning: Could not get current replicas: %v", err))
+	} else {
+		s.addLog(fmt.Sprintf("Current rafay-sentry replicas: %d", replicas))
+	}
+
+	err = s.k8sOps.RestartDeployment("rafay-sentry")
 	if err != nil {
 		return fmt.Errorf("failed to restart rafay-sentry: %v", err)
 	}
-	s.addLog("Successfully restarted rafay-sentry")
+
+	s.addLog("Successfully initiated rafay-sentry restart")
 	return nil
 }
 
 func (s *SOPService) stepGetRelayNodes() error {
+	s.addLog("Getting list of nodes with relay pods")
+
 	pods, err := s.k8sOps.GetRelayPods()
 	if err != nil {
 		return fmt.Errorf("failed to get relay pods: %v", err)
@@ -257,6 +344,18 @@ func (s *SOPService) stepGetRelayNodes() error {
 	for _, pod := range pods {
 		s.addLog(fmt.Sprintf("  - %s/%s on node %s", pod.Namespace, pod.Name, pod.Node))
 	}
+
+	// Get unique nodes
+	nodeMap := make(map[string]bool)
+	for _, pod := range pods {
+		nodeMap[pod.Node] = true
+	}
+
+	s.addLog(fmt.Sprintf("Relay pods running on %d unique nodes", len(nodeMap)))
+	for nodeName := range nodeMap {
+		s.addLog(fmt.Sprintf("  - Node: %s", nodeName))
+	}
+
 	return nil
 }
 
@@ -275,6 +374,8 @@ func (s *SOPService) stepCordonNodes() error {
 		nodeMap[pod.Node] = true
 	}
 
+	s.addLog(fmt.Sprintf("Found %d unique nodes to cordon", len(nodeMap)))
+
 	// Cordon each node
 	for nodeName := range nodeMap {
 		s.addLog(fmt.Sprintf("Cordoning node: %s", nodeName))
@@ -282,8 +383,10 @@ func (s *SOPService) stepCordonNodes() error {
 		if err != nil {
 			return fmt.Errorf("failed to cordon node %s: %v", nodeName, err)
 		}
+		s.addLog(fmt.Sprintf("Successfully cordoned node: %s", nodeName))
 	}
 
+	s.addLog(fmt.Sprintf("Successfully cordoned %d nodes", len(nodeMap)))
 	return nil
 }
 

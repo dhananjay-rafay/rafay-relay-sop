@@ -44,6 +44,24 @@ func (k *K8SOperations) GetNodesWithLabel(label string) ([]string, error) {
 	return nodes, nil
 }
 
+func (k *K8SOperations) GetAllNodes() ([]string, error) {
+	cmd := exec.Command("kubectl", "get", "nodes", "--no-headers", "-o", "custom-columns=NAME:.metadata.name")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get all nodes: %v", err)
+	}
+
+	var nodes []string
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			nodes = append(nodes, strings.TrimSpace(line))
+		}
+	}
+
+	return nodes, nil
+}
+
 func (k *K8SOperations) GetRelayPods() ([]PodInfo, error) {
 	cmd := exec.Command("kubectl", "get", "po", "-A", "-owide")
 	output, err := cmd.Output()

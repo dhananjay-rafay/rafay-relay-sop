@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os/exec"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
@@ -83,38 +85,39 @@ func (a *AWSOperations) GetNodeGroupASG(clusterName, nodeGroupName string) (*str
 }
 
 func (a *AWSOperations) ScaleNodeGroup(asgName string, targetCount int32) error {
-	input := &autoscaling.UpdateAutoScalingGroupInput{
-		AutoScalingGroupName: aws.String(asgName),
-		DesiredCapacity:      aws.Int32(targetCount),
-		MinSize:              aws.Int32(targetCount),
-		MaxSize:              aws.Int32(targetCount * 2), // Allow some headroom
-	}
+	// Use AWS CLI instead of SDK to avoid endpoint resolution issues
+	cmd := exec.Command("aws", "autoscaling", "update-auto-scaling-group",
+		"--auto-scaling-group-name", asgName,
+		"--desired-capacity", fmt.Sprintf("%d", targetCount),
+		"--min-size", fmt.Sprintf("%d", targetCount),
+		"--max-size", fmt.Sprintf("%d", targetCount*2), // Allow some headroom
+		"--region", a.region)
 
-	_, err := a.asgClient.UpdateAutoScalingGroup(context.TODO(), input)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to scale nodegroup: %v", err)
+		return fmt.Errorf("failed to scale nodegroup using AWS CLI: %v, output: %s", err, string(output))
 	}
 
 	return nil
 }
 
 func (a *AWSOperations) GetASGInstances(asgName string) ([]string, error) {
-	input := &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []string{asgName},
-	}
+	// Use AWS CLI instead of SDK to avoid endpoint resolution issues
+	cmd := exec.Command("aws", "autoscaling", "describe-auto-scaling-groups",
+		"--auto-scaling-group-names", asgName,
+		"--region", a.region,
+		"--query", "AutoScalingGroups[0].Instances[*].InstanceId",
+		"--output", "text")
 
-	result, err := a.asgClient.DescribeAutoScalingGroups(context.TODO(), input)
+	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to describe ASG: %v", err)
+		return nil, fmt.Errorf("failed to describe ASG using AWS CLI: %v", err)
 	}
 
-	if len(result.AutoScalingGroups) == 0 {
-		return nil, fmt.Errorf("ASG %s not found", asgName)
-	}
-
-	var instanceIds []string
-	for _, instance := range result.AutoScalingGroups[0].Instances {
-		instanceIds = append(instanceIds, *instance.InstanceId)
+	// Parse the output
+	instanceIds := strings.Fields(string(output))
+	if len(instanceIds) == 0 {
+		return nil, fmt.Errorf("ASG %s not found or has no instances", asgName)
 	}
 
 	return instanceIds, nil
@@ -128,18 +131,19 @@ func (a *AWSOperations) CheckScaleInProtections(asgName string) (map[string]bool
 
 	protections := make(map[string]bool)
 	for _, instanceId := range instanceIds {
-		input := &autoscaling.DescribeAutoScalingInstancesInput{
-			InstanceIds: []string{instanceId},
-		}
+		cmd := exec.Command("aws", "autoscaling", "describe-auto-scaling-instances",
+			"--instance-ids", instanceId,
+			"--region", a.region,
+			"--query", "AutoScalingInstances[0].ProtectedFromScaleIn",
+			"--output", "text")
 
-		result, err := a.asgClient.DescribeAutoScalingInstances(context.TODO(), input)
+		output, err := cmd.Output()
 		if err != nil {
 			continue
 		}
 
-		if len(result.AutoScalingInstances) > 0 {
-			protections[instanceId] = *result.AutoScalingInstances[0].ProtectedFromScaleIn
-		}
+		protected := strings.TrimSpace(string(output)) == "True"
+		protections[instanceId] = protected
 	}
 
 	return protections, nil
@@ -152,15 +156,15 @@ func (a *AWSOperations) RemoveScaleInProtections(asgName string) error {
 	}
 
 	for _, instanceId := range instanceIds {
-		input := &autoscaling.SetInstanceProtectionInput{
-			AutoScalingGroupName: aws.String(asgName),
-			InstanceIds:          []string{instanceId},
-			ProtectedFromScaleIn: aws.Bool(false),
-		}
+		cmd := exec.Command("aws", "autoscaling", "set-instance-protection",
+			"--auto-scaling-group-name", asgName,
+			"--instance-ids", instanceId,
+			"--protected-from-scale-in", "false",
+			"--region", a.region)
 
-		_, err := a.asgClient.SetInstanceProtection(context.TODO(), input)
+		output, err := cmd.CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("failed to remove scale in protection for instance %s: %v", instanceId, err)
+			return fmt.Errorf("failed to remove scale in protection for instance %s: %v, output: %s", instanceId, err, string(output))
 		}
 	}
 
@@ -169,15 +173,15 @@ func (a *AWSOperations) RemoveScaleInProtections(asgName string) error {
 
 func (a *AWSOperations) AddScaleInProtections(asgName string, instanceIds []string) error {
 	for _, instanceId := range instanceIds {
-		input := &autoscaling.SetInstanceProtectionInput{
-			AutoScalingGroupName: aws.String(asgName),
-			InstanceIds:          []string{instanceId},
-			ProtectedFromScaleIn: aws.Bool(true),
-		}
+		cmd := exec.Command("aws", "autoscaling", "set-instance-protection",
+			"--auto-scaling-group-name", asgName,
+			"--instance-ids", instanceId,
+			"--protected-from-scale-in", "true",
+			"--region", a.region)
 
-		_, err := a.asgClient.SetInstanceProtection(context.TODO(), input)
+		output, err := cmd.CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("failed to add scale in protection for instance %s: %v", instanceId, err)
+			return fmt.Errorf("failed to add scale in protection for instance %s: %v, output: %s", instanceId, err, string(output))
 		}
 	}
 

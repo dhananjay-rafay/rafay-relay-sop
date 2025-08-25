@@ -84,21 +84,42 @@ func (a *AWSOperations) GetNodeGroupASG(clusterName, nodeGroupName string) (*str
 	return nil, fmt.Errorf("no Auto Scaling Group found for nodegroup %s", nodeGroupName)
 }
 
-func (a *AWSOperations) ScaleNodeGroup(asgName string, targetCount int32) error {
-	// Use AWS CLI instead of SDK to avoid endpoint resolution issues
-	cmd := exec.Command("aws", "autoscaling", "update-auto-scaling-group",
-		"--auto-scaling-group-name", asgName,
-		"--desired-capacity", fmt.Sprintf("%d", targetCount),
-		"--min-size", fmt.Sprintf("%d", targetCount),
-		"--max-size", fmt.Sprintf("%d", targetCount*2), // Allow some headroom
+func (a *AWSOperations) ScaleEKSNodeGroup(clusterName, nodeGroupName string, targetCount int32) error {
+	// Use AWS CLI to scale the EKS nodegroup directly
+	// Create a temporary JSON file for scaling config
+	scalingConfig := fmt.Sprintf(`{"minSize":%d,"maxSize":%d,"desiredSize":%d}`, targetCount, targetCount*2, targetCount)
+
+	cmd := exec.Command("aws", "eks", "update-nodegroup-config",
+		"--cluster-name", clusterName,
+		"--nodegroup-name", nodeGroupName,
+		"--scaling-config", scalingConfig,
 		"--region", a.region)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to scale nodegroup using AWS CLI: %v, output: %s", err, string(output))
+		return fmt.Errorf("failed to scale EKS nodegroup using AWS CLI: %v, output: %s", err, string(output))
 	}
 
 	return nil
+}
+
+func (a *AWSOperations) GetNodeGroupScalingConfig(clusterName, nodeGroupName string) (int32, error) {
+	// Get nodegroup details to find the current scaling configuration
+	describeInput := &eks.DescribeNodegroupInput{
+		ClusterName:   aws.String(clusterName),
+		NodegroupName: aws.String(nodeGroupName),
+	}
+
+	nodegroup, err := a.eksClient.DescribeNodegroup(context.TODO(), describeInput)
+	if err != nil {
+		return 0, fmt.Errorf("failed to describe nodegroup: %v", err)
+	}
+
+	if nodegroup.Nodegroup.ScalingConfig == nil {
+		return 0, fmt.Errorf("no scaling config found for nodegroup %s", nodeGroupName)
+	}
+
+	return *nodegroup.Nodegroup.ScalingConfig.DesiredSize, nil
 }
 
 func (a *AWSOperations) GetASGInstances(asgName string) ([]string, error) {
@@ -159,7 +180,7 @@ func (a *AWSOperations) RemoveScaleInProtections(asgName string) error {
 		cmd := exec.Command("aws", "autoscaling", "set-instance-protection",
 			"--auto-scaling-group-name", asgName,
 			"--instance-ids", instanceId,
-			"--protected-from-scale-in", "false",
+			"--no-protected-from-scale-in",
 			"--region", a.region)
 
 		output, err := cmd.CombinedOutput()
@@ -186,26 +207,4 @@ func (a *AWSOperations) AddScaleInProtections(asgName string, instanceIds []stri
 	}
 
 	return nil
-}
-
-func (a *AWSOperations) GetInstancePrivateIPs(instanceIds []string) (map[string]string, error) {
-	input := &ec2.DescribeInstancesInput{
-		InstanceIds: instanceIds,
-	}
-
-	result, err := a.ec2Client.DescribeInstances(context.TODO(), input)
-	if err != nil {
-		return nil, fmt.Errorf("failed to describe instances: %v", err)
-	}
-
-	ipMap := make(map[string]string)
-	for _, reservation := range result.Reservations {
-		for _, instance := range reservation.Instances {
-			if instance.PrivateIpAddress != nil {
-				ipMap[*instance.InstanceId] = *instance.PrivateIpAddress
-			}
-		}
-	}
-
-	return ipMap, nil
 }

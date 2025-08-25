@@ -34,6 +34,10 @@ spec:
                 configMapKeyRef:
                   name: rafay-relay-sop-config
                   key: eks-cluster
+            - name: KAFKA_BROKERS
+              value: "kafka-core:9092"
+            - name: KAFKA_TOPIC
+              value: "sop-execution-state"
           resources:
             requests:
               memory: "128Mi"

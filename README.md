@@ -1,10 +1,20 @@
 # Rafay Relay SOP Service
 
-A Kubernetes service that automates the Standard Operating Procedure (SOP) for scaling and managing Rafay Relay deployments in EKS clusters.
+A Kubernetes service that automates the Standard Operating Procedure (SOP) for scaling and managing Rafay Relay deployments in EKS clusters with **resilient execution** capabilities.
 
 ## Overview
 
-This service implements a complete SOP for scaling Rafay Relay deployments with the following steps:
+This service implements a complete SOP for scaling Rafay Relay deployments with **resilient execution** capabilities. The service can recover from pod restarts, network failures, and other interruptions by persisting state to Kafka and implementing retry logic.
+
+### Key Resilience Features
+
+- **🔄 State Persistence**: Execution state is saved to Kafka after each step
+- **🔄 Automatic Recovery**: Resumes from last successful step after pod restarts
+- **🔄 Retry Logic**: Exponential backoff retry mechanism for failed steps
+- **🔄 Idempotent Operations**: Safe to run multiple times without side effects
+- **🔄 Context Preservation**: Intermediate data (pods, nodes) is preserved across restarts
+
+### SOP Steps
 
 1. **Configuration**: Get AWS region and EKS cluster from configmap
 2. **Node Group Discovery**: Find nodegroup with label `Name=nodegroup-relay-services` and nodecount > 1
@@ -82,6 +92,7 @@ curl -XGET http://rafay-relay-sop.rafaycore:8080/health
 - Rafay Relay deployment running in `rafay-core` namespace
 - AWS CLI configured with appropriate permissions
 - OIDC provider already enabled for the EKS cluster
+- **Managed Kafka service** (already available as `kafka-core` service)
 
 ## Installation
 
@@ -148,7 +159,16 @@ aws iam attach-role-policy \
 sed 's/ACCOUNT_ID/123456789012/g' k8s/deployment.yaml | kubectl apply -f -
 ```
 
-### 3. Deploy to Kubernetes (without IAM role)
+### 3. Kafka Configuration (for Resilient Execution)
+
+The service uses your existing managed Kafka service (`kafka-core`) for state persistence. The configuration is already set up to use:
+
+- **Kafka Service**: `kafka-core` (ExternalName service pointing to your managed Kafka)
+- **Topic**: `sop-execution-state` (automatically created if it doesn't exist)
+
+**Note**: If Kafka is not available, the service will continue to work without resilience features.
+
+### 4. Deploy to Kubernetes (without IAM role)
 
 ```bash
 kubectl apply -f k8s/deployment.yaml
@@ -184,6 +204,8 @@ The service can be configured via environment variables or ConfigMap:
 |----------|-------------|---------|
 | `AWS_REGION` | AWS region for EKS cluster | `us-west-2` |
 | `EKS_CLUSTER` | EKS cluster name | `rafay-cluster` |
+| `KAFKA_BROKERS` | Kafka broker addresses | `kafka-core:9092` |
+| `KAFKA_TOPIC` | Kafka topic for state persistence | `sop-execution-state` |
 
 ## Multi-Architecture Support
 
@@ -197,9 +219,33 @@ Multi-arch builds are supported using Docker Buildx, allowing the same image to 
 ## Architecture
 
 - **Main Service** (`main.go`): HTTP server and request handling
-- **SOP Service** (`sop_service.go`): Core SOP execution logic
+- **SOP Service** (`sop_service.go`): Core SOP execution logic with resilience
+- **Resilient State Manager** (`resilient_state.go`): State persistence and recovery using Kafka
 - **AWS Operations** (`aws_operations.go`): EKS and Auto Scaling Group operations
 - **K8S Operations** (`k8s_operations.go`): Kubernetes pod and node management
+
+## Resilient Execution
+
+The service implements resilient execution to handle pod restarts, network failures, and other interruptions:
+
+### How It Works
+
+1. **State Persistence**: After each step, the execution state is saved to Kafka
+2. **Recovery Detection**: On startup, the service checks for existing execution state
+3. **Resume Execution**: If found, execution resumes from the last successful step
+4. **Retry Logic**: Failed steps are retried with exponential backoff
+5. **Context Preservation**: Intermediate data (pods, nodes) is preserved across restarts
+
+### Recovery Scenarios
+
+- **Pod Restart**: Service resumes from last completed step
+- **Network Failure**: Retry logic handles temporary failures
+- **Step Failure**: Automatic retry with exponential backoff
+- **Partial Execution**: Skip completed steps and continue from failure point
+
+### Configuration
+
+Resilient execution is automatically enabled when Kafka is available. The service gracefully degrades to non-resilient mode if Kafka is unavailable.
 
 ### Key Features
 

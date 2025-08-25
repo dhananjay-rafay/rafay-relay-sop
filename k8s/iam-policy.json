@@ -8,6 +8,7 @@
                 "eks:DescribeCluster",
                 "eks:ListNodegroups",
                 "eks:DescribeNodegroup",
+                "eks:UpdateNodegroupConfig",
                 "eks:ListTagsForResource"
             ],
             "Resource": [

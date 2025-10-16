@@ -165,6 +165,12 @@ func (s *SOPService) ExecuteSOP() error {
 				}
 				s.mu.Unlock()
 				return fmt.Errorf("previous execution completed successfully - use /clear to start fresh") // Return error to indicate no new execution
+			} else if existingState.Status == "Cleared" {
+				s.addLog("Previous execution state was cleared, starting fresh execution")
+				// State was cleared, start fresh
+				if err := s.stateManager.ClearOldState(); err != nil {
+					s.addLog(fmt.Sprintf("Warning: Failed to clear old state: %v", err))
+				}
 			} else if existingState.Status == "Failed" {
 				s.addLog("Previous execution failed, starting fresh execution")
 				// Clear the failed state and start fresh
@@ -334,6 +340,14 @@ func (s *SOPService) stepScaleNodeGroup() error {
 	targetCount := currentDesiredSize * 2
 
 	s.addLog(fmt.Sprintf("Current nodegroup desired size: %d", currentDesiredSize))
+	s.addLog(fmt.Sprintf("Target nodegroup size: %d", targetCount))
+
+	// Check if already at target size (idempotency check)
+	if currentDesiredSize >= targetCount {
+		s.addLog(fmt.Sprintf("Nodegroup %s is already at or above target size (%d >= %d), skipping scaling", *nodeGroupName, currentDesiredSize, targetCount))
+		return nil
+	}
+
 	s.addLog(fmt.Sprintf("Scaling EKS nodegroup %s from %d to %d nodes", *nodeGroupName, currentDesiredSize, targetCount))
 
 	// Scale the EKS nodegroup directly
@@ -580,6 +594,15 @@ func (s *SOPService) stepScaleRelayDeployment() error {
 
 	newReplicas := currentReplicas * 2
 
+	s.addLog(fmt.Sprintf("Current deployment replicas: %d", currentReplicas))
+	s.addLog(fmt.Sprintf("Target deployment replicas: %d", newReplicas))
+
+	// Check if already at target replicas (idempotency check)
+	if currentReplicas >= newReplicas {
+		s.addLog(fmt.Sprintf("Deployment %s is already at or above target replicas (%d >= %d), skipping scaling", s.config.Deployment, currentReplicas, newReplicas))
+		return nil
+	}
+
 	// Scale the deployment
 	err = s.k8sOps.ScaleDeployment(s.config.Deployment, newReplicas)
 	if err != nil {
@@ -632,6 +655,14 @@ func (s *SOPService) stepScaleNodeGroupBack() error {
 
 	originalSize := currentDesiredSize / 2 // Scale back to original size
 	s.addLog(fmt.Sprintf("Current nodegroup desired size: %d", currentDesiredSize))
+	s.addLog(fmt.Sprintf("Target nodegroup size: %d", originalSize))
+
+	// Check if already at or below target size (idempotency check)
+	if currentDesiredSize <= originalSize {
+		s.addLog(fmt.Sprintf("Nodegroup %s is already at or below target size (%d <= %d), skipping scaling", *nodeGroupName, currentDesiredSize, originalSize))
+		return nil
+	}
+
 	s.addLog(fmt.Sprintf("Scaling EKS nodegroup %s back to %d nodes", *nodeGroupName, originalSize))
 
 	// Scale the EKS nodegroup back to original size
@@ -654,30 +685,42 @@ func (s *SOPService) stepDeleteOldPods() error {
 		return fmt.Errorf("no old pods found to delete")
 	}
 
-	// Delete old pods (excluding SOP pods)
+	// Extract pod names for parallel deletion
+	var podNames []string
 	for _, pod := range s.oldPods {
-		s.addLog(fmt.Sprintf("Deleting old pod: %s/%s", pod.Namespace, pod.Name))
-		err := s.k8sOps.DeletePod(pod.Name)
-		if err != nil {
-			return fmt.Errorf("failed to delete pod %s: %v", pod.Name, err)
-		}
+		podNames = append(podNames, pod.Name)
+		s.addLog(fmt.Sprintf("Will delete old pod: %s/%s", pod.Namespace, pod.Name))
 	}
 
-	s.addLog(fmt.Sprintf("Successfully deleted %d old pods", len(s.oldPods)))
+	// Delete all old pods in parallel using a single kubectl command
+	s.addLog(fmt.Sprintf("Deleting %d old pods in parallel", len(podNames)))
+	err := s.k8sOps.DeletePods(podNames)
+	if err != nil {
+		return fmt.Errorf("failed to delete old pods: %v", err)
+	}
+
+	s.addLog(fmt.Sprintf("Successfully deleted %d old pods in parallel", len(s.oldPods)))
 
 	// Scale back to original replica count
-	originalReplicas, err := s.k8sOps.GetDeploymentReplicas(s.config.Deployment)
+	currentReplicas, err := s.k8sOps.GetDeploymentReplicas(s.config.Deployment)
 	if err != nil {
 		return fmt.Errorf("failed to get deployment replicas: %v", err)
 	}
 
-	originalReplicas = originalReplicas / 2 // Scale back to original
-	err = s.k8sOps.ScaleDeployment(s.config.Deployment, originalReplicas)
-	if err != nil {
-		return fmt.Errorf("failed to scale back deployment: %v", err)
-	}
+	originalReplicas := currentReplicas / 2 // Scale back to original
+	s.addLog(fmt.Sprintf("Current deployment replicas: %d", currentReplicas))
+	s.addLog(fmt.Sprintf("Target deployment replicas: %d", originalReplicas))
 
-	s.addLog(fmt.Sprintf("Scaled deployment back to %d replicas", originalReplicas))
+	// Check if already at or below target replicas (idempotency check)
+	if currentReplicas <= originalReplicas {
+		s.addLog(fmt.Sprintf("Deployment %s is already at or below target replicas (%d <= %d), skipping scaling", s.config.Deployment, currentReplicas, originalReplicas))
+	} else {
+		err = s.k8sOps.ScaleDeployment(s.config.Deployment, originalReplicas)
+		if err != nil {
+			return fmt.Errorf("failed to scale back deployment: %v", err)
+		}
+		s.addLog(fmt.Sprintf("Scaled deployment back to %d replicas", originalReplicas))
+	}
 	return nil
 }
 
@@ -810,8 +853,33 @@ func (s *SOPService) resumeExecution(state *SOPExecutionState) error {
 		}
 	}
 
-	// Continue execution from the next step
-	return s.ExecuteSOP()
+	// Find the last successfully completed step
+	lastCompletedStep := -1
+	for stepNum, stepResult := range state.StepResults {
+		if stepResult.Status == "Completed" {
+			lastCompletedStep = stepNum
+		}
+	}
+
+	// Determine the resume step: start from the next step after the last completed one
+	resumeStep := lastCompletedStep + 1
+	if resumeStep < 0 {
+		resumeStep = 0 // Start from beginning if no steps completed
+	}
+
+	s.addLog(fmt.Sprintf("Last completed step: %d, resuming from step: %d", lastCompletedStep, resumeStep))
+
+	// Set up the status for resumed execution
+	s.mu.Lock()
+	s.status = SOPStatus{
+		Status:    "Running",
+		StartTime: state.StartTime,
+		Logs:      []string{fmt.Sprintf("Resumed execution from step %d (last completed: %d) at %s", resumeStep, lastCompletedStep, time.Now().Format("2006-01-02 15:04:05"))},
+	}
+	s.mu.Unlock()
+
+	// Continue execution from the resume step
+	return s.continueExecutionFromStep(resumeStep)
 }
 
 // executeStepWithRetry executes a step with retry logic
@@ -842,4 +910,87 @@ func (s *SOPService) executeStepWithRetry(stepFn func() error, stepIndex int) er
 	}
 
 	return fmt.Errorf("step failed after all retry attempts")
+}
+
+// continueExecutionFromStep continues execution from a specific step
+func (s *SOPService) continueExecutionFromStep(startStep int) error {
+	defer func() {
+		s.mu.Lock()
+		endTime := time.Now()
+		s.status.EndTime = &endTime
+		if s.status.Status == "Running" {
+			s.status.Status = "Success"
+		}
+		s.mu.Unlock()
+
+		// Mark execution as completed in resilient state
+		if s.stateManager != nil {
+			if err := s.stateManager.CompleteExecution(); err != nil {
+				// Don't log completion failure if state persistence is already disabled
+			}
+		}
+	}()
+
+	steps := []struct {
+		name string
+		fn   func() error
+	}{
+		{"Get AWS region and EKS cluster from configmap", s.stepGetConfig},
+		{"Find nodegroup with label Name=nodegroup-relay-services and nodecount >1", s.stepFindNodeGroup},
+		{"Get list of nodes with old relay pods", s.stepGetOldRelayNodes},
+		{"Cordon nodes with old relay pods", s.stepCordonNodes},
+		{"Scale nodegroup to 2X current count", s.stepScaleNodeGroup},
+		{"Wait for new nodes to join cluster", s.stepWaitForNewNodes},
+		{"Scale rafay-relay deployment to 2x", s.stepScaleRelayDeployment},
+		{"Wait for new pods to be running", s.stepWaitForNewPods},
+		{"Delete old pods and scale back deployment", s.stepDeleteOldPods},
+		{"Remove scale in protections", s.stepRemoveScaleInProtections},
+		{"Add scale in protection for new nodes", s.stepAddScaleInProtections},
+		{"Scale nodegroup back to original size", s.stepScaleNodeGroupBack},
+	}
+
+	// Start from the specified step
+	for i := startStep; i < len(steps); i++ {
+		s.addLog(fmt.Sprintf("Processing step %d: %s", i, steps[i].name))
+
+		// Check if step should be skipped (already completed)
+		if s.stateManager != nil {
+			state := s.stateManager.GetCurrentState()
+			if state != nil && state.StepResults[i].Status == "Completed" {
+				s.addLog(fmt.Sprintf("Skipping completed step %d: %s", i, steps[i].name))
+				continue
+			}
+		}
+
+		// Start the step
+		if s.stateManager != nil {
+			if err := s.stateManager.StartStep(i, steps[i].name); err != nil {
+				s.addLog(fmt.Sprintf("Warning: Failed to start step tracking: %v", err))
+			}
+		}
+
+		// Execute the step with retry logic
+		s.addLog(fmt.Sprintf("Executing step %d: %s", i, steps[i].name))
+		if err := s.executeStepWithRetry(steps[i].fn, i); err != nil {
+			// Mark step as failed
+			if s.stateManager != nil {
+				if err2 := s.stateManager.FailStep(i, err.Error()); err2 != nil {
+					s.addLog(fmt.Sprintf("Warning: Failed to mark step as failed: %v", err2))
+				}
+			}
+			s.addLog(fmt.Sprintf("Step %d (%s) failed: %v", i, steps[i].name, err))
+			return fmt.Errorf("step %d (%s) failed: %v", i, steps[i].name, err)
+		}
+
+		// Mark step as completed
+		if s.stateManager != nil {
+			if err := s.stateManager.CompleteStep(i); err != nil {
+				s.addLog(fmt.Sprintf("Warning: Failed to mark step as completed: %v", err))
+			}
+		}
+
+		s.addLog(fmt.Sprintf("Successfully completed step %d: %s", i, steps[i].name))
+	}
+
+	return nil
 }

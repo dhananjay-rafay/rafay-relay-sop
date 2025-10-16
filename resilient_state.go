@@ -293,8 +293,34 @@ func (rsm *ResilientStateManager) GetContext(key string) interface{} {
 // ClearOldState clears the current state and starts fresh
 func (rsm *ResilientStateManager) ClearOldState() error {
 	rsm.logger.Info("Clearing old execution state")
+
+	// Clear in-memory state
 	rsm.state = nil
 	rsm.executionID = uuid.New().String()
+
+	// Clear Kafka topic by sending a "cleared" state message
+	clearedState := &SOPExecutionState{
+		ExecutionID:    rsm.executionID,
+		Status:         "Cleared",
+		CurrentStep:    -1,
+		TotalSteps:     0,
+		StepResults:    make(map[int]StepResult),
+		StartTime:      time.Now(),
+		LastUpdateTime: time.Now(),
+		Context:        make(map[string]interface{}),
+	}
+
+	// Temporarily set the state to persist the cleared message
+	rsm.state = clearedState
+	if err := rsm.persistState(); err != nil {
+		rsm.logger.Warnf("Failed to persist cleared state: %v", err)
+		// Don't fail the clear operation if Kafka is unavailable
+	}
+
+	// Clear the state again
+	rsm.state = nil
+
+	rsm.logger.Info("Successfully cleared execution state")
 	return nil
 }
 

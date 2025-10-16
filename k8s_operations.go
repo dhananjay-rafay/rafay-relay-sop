@@ -157,6 +157,22 @@ func (k *K8SOperations) DeletePod(podName string) error {
 	return nil
 }
 
+func (k *K8SOperations) DeletePods(podNames []string) error {
+	if len(podNames) == 0 {
+		return nil
+	}
+
+	// Build the kubectl command with all pod names
+	args := []string{"delete", "pod", "-n", k.namespace}
+	args = append(args, podNames...)
+
+	cmd := exec.Command("kubectl", args...)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to delete pods %v: %v", podNames, err)
+	}
+	return nil
+}
+
 func (k *K8SOperations) RestartDeployment(deploymentName string) error {
 	cmd := exec.Command("kubectl", "rollout", "restart", "deployment/"+deploymentName, "-n", k.namespace)
 	if err := cmd.Run(); err != nil {

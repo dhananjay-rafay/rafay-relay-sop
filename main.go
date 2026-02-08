@@ -138,6 +138,12 @@ func handleClear(w http.ResponseWriter, r *http.Request) {
 	logger.Info("Received /clear request")
 
 	if sopService.stateManager != nil {
+		// Load current state from Kafka and revert any cluster changes (uncordon nodes, scale nodegroup back)
+		if state, err := sopService.stateManager.LoadExistingState(); err == nil && state != nil {
+			logger.Info("Reverting cluster changes from previous execution before clearing state")
+			sopService.RevertSteps(state)
+		}
+
 		if err := sopService.stateManager.ClearOldState(); err != nil {
 			logger.Errorf("Failed to clear state: %v", err)
 			w.Header().Set("Content-Type", "application/json")

@@ -125,6 +125,14 @@ func (k *K8SOperations) CordonNode(nodeName string) error {
 	return nil
 }
 
+func (k *K8SOperations) UncordonNode(nodeName string) error {
+	cmd := exec.Command("kubectl", "uncordon", nodeName)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to uncordon node %s: %v", nodeName, err)
+	}
+	return nil
+}
+
 func (k *K8SOperations) ScaleDeployment(deploymentName string, replicas int32) error {
 	deployment, err := k.client.AppsV1().Deployments(k.namespace).Get(context.TODO(), deploymentName, metav1.GetOptions{})
 	if err != nil {

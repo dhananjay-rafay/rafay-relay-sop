@@ -342,6 +342,12 @@ func (s *SOPService) stepScaleNodeGroup() error {
 	s.addLog(fmt.Sprintf("Current nodegroup desired size: %d", currentDesiredSize))
 	s.addLog(fmt.Sprintf("Target nodegroup size: %d", targetCount))
 
+	// Persist original size and nodegroup name for revert on clear
+	if s.stateManager != nil {
+		_ = s.stateManager.SetContext("originalNodegroupSize", int(currentDesiredSize))
+		_ = s.stateManager.SetContext("nodegroupName", *nodeGroupName)
+	}
+
 	// Check if already at target size (idempotency check)
 	if currentDesiredSize >= targetCount {
 		s.addLog(fmt.Sprintf("Nodegroup %s is already at or above target size (%d >= %d), skipping scaling", *nodeGroupName, currentDesiredSize, targetCount))
@@ -433,9 +439,13 @@ func (s *SOPService) stepWaitForNewNodes() error {
 		return fmt.Errorf("failed to get nodegroup scaling config: %v", err)
 	}
 
-	// We need to wait for the nodegroup to actually scale up
-	// The target should be the scaled up size (2x original)
-	targetNewNodes := int(targetDesiredSize) // We expect the same number of new nodes as original
+	// We need to wait for (targetDesiredSize - initialCount) new nodes to join.
+	// e.g. scale 3->6: initialCount=3, targetDesiredSize=6, so we wait for 3 new nodes.
+	targetNewNodes := int(targetDesiredSize) - initialCount
+	if targetNewNodes <= 0 {
+		s.addLog("No new nodes expected (nodegroup already at or above target); step succeeds")
+		return nil
+	}
 	s.addLog(fmt.Sprintf("Target new relay node count: %d", targetNewNodes))
 
 	// Wait for new relay nodes to join and be ready (with timeout)
@@ -555,6 +565,7 @@ func (s *SOPService) stepCordonNodes() error {
 		s.addLog(fmt.Sprintf("  - %s", nodeName))
 	}
 
+	var cordonedNodeNames []string
 	// Cordon each node
 	for _, nodeName := range s.oldNodes {
 		s.addLog(fmt.Sprintf("Processing node: %s", nodeName))
@@ -578,7 +589,13 @@ func (s *SOPService) stepCordonNodes() error {
 		if err != nil {
 			return fmt.Errorf("failed to cordon node %s: %v", actualNodeName, err)
 		}
+		cordonedNodeNames = append(cordonedNodeNames, actualNodeName)
 		s.addLog(fmt.Sprintf("Successfully cordoned node: %s", actualNodeName))
+	}
+
+	// Persist cordoned node names for revert on clear
+	if s.stateManager != nil && len(cordonedNodeNames) > 0 {
+		_ = s.stateManager.SetContext("cordonedNodes", cordonedNodeNames)
 	}
 
 	s.addLog(fmt.Sprintf("Successfully cordoned %d nodes", len(s.oldNodes)))
@@ -675,6 +692,66 @@ func (s *SOPService) stepScaleNodeGroupBack() error {
 	s.addLog("Note: Nodegroup scaling back may take several minutes to complete")
 
 	return nil
+}
+
+// RevertSteps undoes cluster changes from a previous SOP run (e.g. before clear).
+// It uncordons any nodes that were cordoned and scales the nodegroup back to original size.
+func (s *SOPService) RevertSteps(state *SOPExecutionState) {
+	if state == nil || state.Context == nil {
+		return
+	}
+	ctx := state.Context
+
+	// 1. Scale nodegroup back to original size (undo 2x scale-up)
+	if ngNameRaw, ok := ctx["nodegroupName"]; ok && ngNameRaw != nil {
+		ngName, _ := ngNameRaw.(string)
+		origSizeRaw, hasSize := ctx["originalNodegroupSize"]
+		if ngName != "" && hasSize && origSizeRaw != nil {
+			var originalSize int32
+			switch v := origSizeRaw.(type) {
+			case float64:
+				originalSize = int32(v)
+			case int:
+				originalSize = int32(v)
+			case int32:
+				originalSize = v
+			default:
+				logrus.Warnf("Revert: unexpected originalNodegroupSize type: %T", origSizeRaw)
+				originalSize = 0
+			}
+			if originalSize > 0 {
+				logrus.Infof("Revert: scaling nodegroup %s back to %d nodes", ngName, originalSize)
+				if err := s.awsOps.ScaleEKSNodeGroup(s.config.EKSCluster, ngName, originalSize); err != nil {
+					logrus.Warnf("Revert: failed to scale nodegroup back: %v", err)
+				} else {
+					logrus.Infof("Revert: successfully initiated scale-back of nodegroup %s to %d", ngName, originalSize)
+				}
+			}
+		}
+	}
+
+	// 2. Uncordon nodes that were cordoned
+	if cordonedRaw, ok := ctx["cordonedNodes"]; ok && cordonedRaw != nil {
+		var nodeNames []string
+		switch v := cordonedRaw.(type) {
+		case []string:
+			nodeNames = v
+		case []interface{}:
+			for _, e := range v {
+				if str, ok := e.(string); ok {
+					nodeNames = append(nodeNames, str)
+				}
+			}
+		}
+		for _, nodeName := range nodeNames {
+			logrus.Infof("Revert: uncordoning node %s", nodeName)
+			if err := s.k8sOps.UncordonNode(nodeName); err != nil {
+				logrus.Warnf("Revert: failed to uncordon node %s: %v", nodeName, err)
+			} else {
+				logrus.Infof("Revert: successfully uncordoned node %s", nodeName)
+			}
+		}
+	}
 }
 
 func (s *SOPService) stepDeleteOldPods() error {

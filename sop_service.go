@@ -564,15 +564,20 @@ func (s *SOPService) stepGetOldRelayNodes() error {
 		return fmt.Errorf("failed to get relay pods: %v", err)
 	}
 
-	// Filter out SOP pods
+	// Filter out SOP pods and pods that are not yet scheduled on a node (Node == "" or "<none>")
 	var oldPods []PodInfo
 	for _, pod := range pods {
-		if !strings.Contains(pod.Name, "rafay-relay-sop") {
-			oldPods = append(oldPods, pod)
+		if strings.Contains(pod.Name, "rafay-relay-sop") {
+			continue
 		}
+		if pod.Node == "" || pod.Node == "<none>" {
+			// Pod is not scheduled on any node yet; skip it so we don't try to cordon "<none>"
+			continue
+		}
+		oldPods = append(oldPods, pod)
 	}
 
-	s.addLog(fmt.Sprintf("Found %d old relay pods (excluding SOP)", len(oldPods)))
+	s.addLog(fmt.Sprintf("Found %d old relay pods (excluding SOP and unscheduled pods)", len(oldPods)))
 	for _, pod := range oldPods {
 		s.addLog(fmt.Sprintf("  - %s/%s on node %s", pod.Namespace, pod.Name, pod.Node))
 	}
@@ -629,6 +634,12 @@ func (s *SOPService) stepCordonNodes() error {
 	var cordonedNodeNames []string
 	// Cordon each node
 	for _, nodeName := range s.oldNodes {
+		// Extra safety: skip any bogus entries that somehow slipped through
+		if nodeName == "" || nodeName == "<none>" {
+			s.addLog(fmt.Sprintf("Skipping invalid node name: %q", nodeName))
+			continue
+		}
+
 		s.addLog(fmt.Sprintf("Processing node: %s", nodeName))
 
 		// Check if nodeName is an IP address and convert to node name if needed
@@ -659,7 +670,7 @@ func (s *SOPService) stepCordonNodes() error {
 		_ = s.stateManager.SetContext("cordonedNodes", cordonedNodeNames)
 	}
 
-	s.addLog(fmt.Sprintf("Successfully cordoned %d nodes", len(s.oldNodes)))
+	s.addLog(fmt.Sprintf("Successfully cordoned %d nodes", len(cordonedNodeNames)))
 	return nil
 }
 
@@ -826,6 +837,34 @@ func (s *SOPService) RevertSteps(state *SOPExecutionState) {
 				logrus.Warnf("Revert: failed to uncordon node %s: %v", nodeName, err)
 			} else {
 				logrus.Infof("Revert: successfully uncordoned node %s", nodeName)
+			}
+		}
+	}
+
+	// 3. If there are pending relay pods, scale the deployment back down to match scheduled pods
+	if s.k8sOps != nil {
+		pods, err := s.k8sOps.GetRelayPods()
+		if err != nil {
+			logrus.Warnf("Revert: failed to get relay pods while checking for pending pods: %v", err)
+			return
+		}
+
+		var scheduledCount int32
+		hasPending := false
+		for _, pod := range pods {
+			if pod.Node == "" || pod.Node == "<none>" {
+				hasPending = true
+			} else {
+				scheduledCount++
+			}
+		}
+
+		if hasPending && scheduledCount > 0 {
+			logrus.Infof("Revert: found pending relay pods; scaling deployment %s down to %d replicas", s.config.Deployment, scheduledCount)
+			if err := s.k8sOps.ScaleDeployment(s.config.Deployment, scheduledCount); err != nil {
+				logrus.Warnf("Revert: failed to scale relay deployment during rollback: %v", err)
+			} else {
+				logrus.Infof("Revert: successfully scaled relay deployment %s down to %d replicas", s.config.Deployment, scheduledCount)
 			}
 		}
 	}

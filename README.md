@@ -20,9 +20,9 @@ This service implements a complete SOP for scaling Rafay Relay deployments with 
 2. **Node Group Discovery**: Find nodegroup with label `Name=nodegroup-relay-services` and nodecount > 1
 3. **Scale Node Group**: Scale the nodegroup to 2X its current count
 4. **Verify Nodes**: Check that new nodes are showing up and node count matches
-5. **Restart Sentry**: Rollout restart rafay-sentry deployment
-6. **Get Relay Nodes**: Get list of nodes on which relay pods are running
-7. **Cordon Old Nodes**: Cordon nodes on which the old relay pods are running
+5. **Get Relay Nodes**: Get list of nodes on which relay pods are running
+6. **Cordon Old Nodes**: Cordon nodes on which the old relay pods are running
+7. **Restart Sentry**: Rollout restart `rafay-sentry` deployment and wait until all sentry pods are available
 8. **Scale Relay Deployment**: Scale rafay-relay deployment to 2x its current replica count
 9. **Delete Old Pods**: Delete old pods so they end up in pending state, then scale back deployment
 10. **Get New Relay Nodes**: Get list of nodes on which new relay pods are running

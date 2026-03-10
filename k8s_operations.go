@@ -7,8 +7,10 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 )
 
 type K8SOperations struct {
@@ -134,15 +136,25 @@ func (k *K8SOperations) UncordonNode(nodeName string) error {
 }
 
 func (k *K8SOperations) ScaleDeployment(deploymentName string, replicas int32) error {
-	deployment, err := k.client.AppsV1().Deployments(k.namespace).Get(context.TODO(), deploymentName, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get deployment: %v", err)
+	if replicas < 0 {
+		return fmt.Errorf("replicas cannot be negative: %d", replicas)
 	}
 
-	deployment.Spec.Replicas = &replicas
-	_, err = k.client.AppsV1().Deployments(k.namespace).Update(context.TODO(), deployment, metav1.UpdateOptions{})
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		deployment, err := k.client.AppsV1().Deployments(k.namespace).Get(context.TODO(), deploymentName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		deployment.Spec.Replicas = &replicas
+		_, err = k.client.AppsV1().Deployments(k.namespace).Update(context.TODO(), deployment, metav1.UpdateOptions{})
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("failed to scale deployment: %v", err)
+		if apierrors.IsConflict(err) {
+			return fmt.Errorf("failed to scale deployment %s due to update conflict after retries: %v", deploymentName, err)
+		}
+		return fmt.Errorf("failed to scale deployment %s: %v", deploymentName, err)
 	}
 
 	return nil
@@ -158,9 +170,10 @@ func (k *K8SOperations) GetDeploymentReplicas(deploymentName string) (int32, err
 }
 
 func (k *K8SOperations) DeletePod(podName string) error {
-	cmd := exec.Command("kubectl", "delete", "pod", podName, "-n", k.namespace)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to delete pod %s: %v", podName, err)
+	cmd := exec.Command("kubectl", "delete", "pod", podName, "-n", k.namespace, "--ignore-not-found=true")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to delete pod %s: %v (output: %s)", podName, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -171,12 +184,13 @@ func (k *K8SOperations) DeletePods(podNames []string) error {
 	}
 
 	// Build the kubectl command with all pod names
-	args := []string{"delete", "pod", "-n", k.namespace}
+	args := []string{"delete", "pod", "-n", k.namespace, "--ignore-not-found=true"}
 	args = append(args, podNames...)
 
 	cmd := exec.Command("kubectl", args...)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to delete pods %v: %v", podNames, err)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to delete pods %v: %v (output: %s)", podNames, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }

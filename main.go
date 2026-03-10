@@ -37,6 +37,7 @@ func main() {
 	router.HandleFunc("/run", handleRun).Methods("GET")
 	router.HandleFunc("/status", handleStatus).Methods("GET")
 	router.HandleFunc("/clear", handleClear).Methods("GET")
+	router.HandleFunc("/rollback", handleRollback).Methods("GET")
 	router.HandleFunc("/health", handleHealth).Methods("GET")
 
 	// Setup server
@@ -93,18 +94,22 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response := map[string]interface{}{
-		"status":  "started",
-		"message": "SOP execution started",
-		"time":    time.Now().UTC(),
+	// Ensure only one execution runs at a time; fail fast if busy
+	if sopService != nil && !sopService.tryAcquireExecution() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "busy",
+			"message": "SOP execution already running",
+			"time":    time.Now().UTC(),
+		})
+		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
 
 	// Start SOP execution in background
 	go func() {
+		defer sopService.releaseExecution()
+
 		if err := sopService.ExecuteSOP(); err != nil {
 			// Check if this is a "completed execution" error (not a real failure)
 			if strings.Contains(err.Error(), "previous execution completed successfully") {
@@ -116,6 +121,17 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 			logger.Info("SOP execution completed successfully")
 		}
 	}()
+
+	// Only send "started" after we've scheduled a run that will actually execute
+	response := map[string]interface{}{
+		"status":  "started",
+		"message": "SOP execution started",
+		"time":    time.Now().UTC(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -138,12 +154,6 @@ func handleClear(w http.ResponseWriter, r *http.Request) {
 	logger.Info("Received /clear request")
 
 	if sopService.stateManager != nil {
-		// Load current state from Kafka and revert any cluster changes (uncordon nodes, scale nodegroup back)
-		if state, err := sopService.stateManager.LoadExistingState(); err == nil && state != nil {
-			logger.Info("Reverting cluster changes from previous execution before clearing state")
-			sopService.RevertSteps(state)
-		}
-
 		if err := sopService.stateManager.ClearOldState(); err != nil {
 			logger.Errorf("Failed to clear state: %v", err)
 			w.Header().Set("Content-Type", "application/json")
@@ -156,4 +166,58 @@ func handleClear(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"message": "State cleared successfully"})
+}
+
+func handleRollback(w http.ResponseWriter, r *http.Request) {
+	logger.Info("Received /rollback request")
+
+	// Do not rollback while an execution is actively running to avoid races
+	if sopService != nil && sopService.IsExecutionRunning() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":   "Rollback not allowed while SOP execution is running",
+			"message": "Wait for the current execution to finish, or use /clear after it completes.",
+		})
+		return
+	}
+
+	if sopService.stateManager == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Rollback not available: state manager is disabled"})
+		return
+	}
+
+	// Load latest execution state and revert any completed changes
+	state, err := sopService.stateManager.LoadExistingState()
+	if err != nil {
+		logger.Errorf("Failed to load execution state for rollback: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to load execution state for rollback"})
+		return
+	}
+	if state == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "No execution state found to rollback"})
+		return
+	}
+
+	logger.Infof("Starting rollback for execution %s (status: %s, step: %d)", state.ExecutionID, state.Status, state.CurrentStep)
+	sopService.RevertSteps(state)
+
+	// After rollback, clear the persisted execution state so future runs start fresh
+	if err := sopService.stateManager.ClearOldState(); err != nil {
+		logger.Errorf("Failed to clear state after rollback: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Rollback completed, but failed to clear state"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Rollback completed and state cleared"})
 }

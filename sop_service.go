@@ -29,6 +29,8 @@ type SOPStatus struct {
 type SOPService struct {
 	mu           sync.RWMutex
 	status       SOPStatus
+	runStateMu   sync.Mutex
+	runInFlight  bool
 	k8sClient    *kubernetes.Clientset
 	awsConfig    aws.Config
 	eksClient    *eks.Client
@@ -43,11 +45,12 @@ type SOPService struct {
 }
 
 type Config struct {
-	AWSRegion  string
-	EKSCluster string
-	Namespace  string
-	NodeGroup  string
-	Deployment string
+	AWSRegion        string
+	EKSCluster       string
+	Namespace        string
+	NodeGroup        string
+	Deployment       string
+	SentryDeployment string
 }
 
 func NewSOPService() (*SOPService, error) {
@@ -122,11 +125,12 @@ func loadConfigFromConfigMap() (*Config, error) {
 	// This would typically load from a configmap
 	// For now, we'll use environment variables or defaults
 	return &Config{
-		AWSRegion:  getEnvOrDefault("AWS_REGION", "us-east-1"),
-		EKSCluster: getEnvOrDefault("EKS_CLUSTER", "upgrade-tb"),
-		Namespace:  "rafay-core",
-		NodeGroup:  "nodegroup-relay-services",
-		Deployment: "rafay-relay",
+		AWSRegion:        getEnvOrDefault("AWS_REGION", "us-east-1"),
+		EKSCluster:       getEnvOrDefault("EKS_CLUSTER", "upgrade-tb"),
+		Namespace:        "rafay-core",
+		NodeGroup:        "nodegroup-relay-services",
+		Deployment:       "rafay-relay",
+		SentryDeployment: getEnvOrDefault("SENTRY_DEPLOYMENT", "rafay-sentry"),
 	}, nil
 }
 
@@ -142,40 +146,89 @@ func getEnv(key string) string {
 	return os.Getenv(key)
 }
 
-func (s *SOPService) ExecuteSOP() error {
+func (s *SOPService) tryAcquireExecution() bool {
+	s.runStateMu.Lock()
+	defer s.runStateMu.Unlock()
+	if s.runInFlight {
+		return false
+	}
+	s.runInFlight = true
+	return true
+}
+
+func (s *SOPService) IsExecutionRunning() bool {
+	s.runStateMu.Lock()
+	defer s.runStateMu.Unlock()
+	return s.runInFlight
+}
+
+func (s *SOPService) releaseExecution() {
+	s.runStateMu.Lock()
+	s.runInFlight = false
+	s.runStateMu.Unlock()
+}
+
+func isSkipExecutionErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "previous execution completed successfully")
+}
+
+func (s *SOPService) ExecuteSOP() (err error) {
 	// Check for existing state and attempt recovery
 	if s.stateManager != nil {
 		if existingState, err := s.stateManager.LoadExistingState(); err == nil && existingState != nil {
 			s.addLog(fmt.Sprintf("Found existing execution state: %s (status: %s, step: %d)",
 				existingState.ExecutionID, existingState.Status, existingState.CurrentStep))
 
-			if existingState.Status == "Running" || existingState.Status == "Resuming" {
-				s.addLog("Attempting to resume execution from previous state")
-				return s.resumeExecution(existingState)
-			} else if existingState.Status == "Completed" {
-				s.addLog("Previous execution was completed successfully")
-				s.addLog("To start a new execution, clear the state first using /clear endpoint")
-				// Restore the completed state for status reporting
-				s.mu.Lock()
-				s.status = SOPStatus{
-					Status:    "Success",
-					StartTime: existingState.StartTime,
-					EndTime:   &existingState.LastUpdateTime,
-					Logs:      []string{fmt.Sprintf("Execution completed successfully at %s", existingState.LastUpdateTime.Format(time.RFC3339))},
-				}
-				s.mu.Unlock()
-				return fmt.Errorf("previous execution completed successfully - use /clear to start fresh") // Return error to indicate no new execution
-			} else if existingState.Status == "Cleared" {
-				s.addLog("Previous execution state was cleared, starting fresh execution")
-				// State was cleared, start fresh
+			// Detect incompatible step layout (e.g. state created before sentry step was added).
+			// Old executions used 12 steps; current code uses 13.
+			const currentTotalSteps = 13
+			if existingState.TotalSteps != currentTotalSteps {
+				s.addLog(fmt.Sprintf("Detected execution state with %d steps, but current SOP expects %d steps; reverting cluster changes then clearing old state to avoid mismatched resumption", existingState.TotalSteps, currentTotalSteps))
+
+				// Best-effort revert of any changes made by the old execution (scale/cordon, etc.)
+				s.RevertSteps(existingState)
+
 				if err := s.stateManager.ClearOldState(); err != nil {
-					s.addLog(fmt.Sprintf("Warning: Failed to clear old state: %v", err))
+					s.addLog(fmt.Sprintf("Warning: Failed to clear incompatible old state: %v", err))
 				}
-			} else if existingState.Status == "Failed" {
-				s.addLog("Previous execution failed, starting fresh execution")
-				// Clear the failed state and start fresh
-				if err := s.stateManager.ClearOldState(); err != nil {
-					s.addLog(fmt.Sprintf("Warning: Failed to clear old state: %v", err))
+				// Treat as if no existing state was found
+				existingState = nil
+			}
+
+			// If after compatibility check we still have a state, handle it as before
+			if existingState != nil {
+
+				if existingState.Status == "Running" || existingState.Status == "Resuming" {
+					s.addLog("Attempting to resume execution from previous state")
+					return s.resumeExecution(existingState)
+				} else if existingState.Status == "Completed" {
+					s.addLog("Previous execution was completed successfully")
+					s.addLog("To start a new execution, clear the state first using /clear endpoint")
+					// Restore the completed state for status reporting
+					s.mu.Lock()
+					s.status = SOPStatus{
+						Status:    "Success",
+						StartTime: existingState.StartTime,
+						EndTime:   &existingState.LastUpdateTime,
+						Logs:      []string{fmt.Sprintf("Execution completed successfully at %s", existingState.LastUpdateTime.Format(time.RFC3339))},
+					}
+					s.mu.Unlock()
+					return fmt.Errorf("previous execution completed successfully - use /clear to start fresh") // Return error to indicate no new execution
+				} else if existingState.Status == "Cleared" {
+					s.addLog("Previous execution state was cleared, starting fresh execution")
+					// State was cleared, start fresh
+					if err := s.stateManager.ClearOldState(); err != nil {
+						s.addLog(fmt.Sprintf("Warning: Failed to clear old state: %v", err))
+					}
+				} else if existingState.Status == "Failed" {
+					s.addLog("Previous execution failed, starting fresh execution")
+					// Clear the failed state and start fresh
+					if err := s.stateManager.ClearOldState(); err != nil {
+						s.addLog(fmt.Sprintf("Warning: Failed to clear old state: %v", err))
+					}
 				}
 			}
 		}
@@ -192,7 +245,7 @@ func (s *SOPService) ExecuteSOP() error {
 
 	// Initialize resilient state if available
 	if s.stateManager != nil {
-		if err := s.stateManager.InitializeState(12); err != nil {
+		if err := s.stateManager.InitializeState(13); err != nil {
 			s.addLog(fmt.Sprintf("Warning: Failed to initialize resilient state: %v", err))
 			// Disable state manager if initialization fails
 			s.stateManager = nil
@@ -203,16 +256,17 @@ func (s *SOPService) ExecuteSOP() error {
 		s.mu.Lock()
 		endTime := time.Now()
 		s.status.EndTime = &endTime
-		if s.status.Status == "Running" {
+		if err != nil && !isSkipExecutionErr(err) {
+			s.status.Status = "Failed"
+			s.status.Error = err.Error()
+		} else if s.status.Status == "Running" {
 			s.status.Status = "Success"
 		}
 		s.mu.Unlock()
 
-		// Mark execution as completed in resilient state
-		if s.stateManager != nil {
-			if err := s.stateManager.CompleteExecution(); err != nil {
-				// Don't log completion failure if state persistence is already disabled
-			}
+		// Mark execution as completed in resilient state only on success (or skip)
+		if s.stateManager != nil && (err == nil || isSkipExecutionErr(err)) {
+			_ = s.stateManager.CompleteExecution()
 		}
 	}()
 
@@ -226,6 +280,7 @@ func (s *SOPService) ExecuteSOP() error {
 		{"Cordon nodes with old relay pods", s.stepCordonNodes},
 		{"Scale nodegroup to 2X current count", s.stepScaleNodeGroup},
 		{"Wait for new nodes to join cluster", s.stepWaitForNewNodes},
+		{"Rollout restart rafay-sentry deployment", s.stepRestartSentryDeployment},
 		{"Scale rafay-relay deployment to 2x", s.stepScaleRelayDeployment},
 		{"Wait for new pods to be running", s.stepWaitForNewPods},
 		{"Delete old pods and scale back deployment", s.stepDeleteOldPods},
@@ -264,6 +319,12 @@ func (s *SOPService) ExecuteSOP() error {
 			if s.stateManager != nil {
 				if err := s.stateManager.FailStep(i, err.Error()); err != nil {
 					// Don't log state persistence failures for step failures
+				}
+
+				// On execution failure, attempt rollback based on current state
+				if state := s.stateManager.GetCurrentState(); state != nil {
+					s.addLog("Execution failed, initiating automatic rollback of completed steps")
+					s.RevertSteps(state)
 				}
 			}
 
@@ -655,6 +716,22 @@ func (s *SOPService) stepWaitForNewPods() error {
 	return nil
 }
 
+func (s *SOPService) stepRestartSentryDeployment() error {
+	s.addLog(fmt.Sprintf("Rolling out restart of sentry deployment %s", s.config.SentryDeployment))
+
+	if err := s.k8sOps.RestartDeployment(s.config.SentryDeployment); err != nil {
+		return fmt.Errorf("failed to restart sentry deployment %s: %v", s.config.SentryDeployment, err)
+	}
+
+	// Wait for all sentry pods to be available
+	if err := s.k8sOps.WaitForDeploymentReady(s.config.SentryDeployment, 5*time.Minute); err != nil {
+		return fmt.Errorf("failed to wait for sentry deployment %s to be ready: %v", s.config.SentryDeployment, err)
+	}
+
+	s.addLog(fmt.Sprintf("Sentry deployment %s successfully restarted and all pods are available", s.config.SentryDeployment))
+	return nil
+}
+
 func (s *SOPService) stepScaleNodeGroupBack() error {
 	s.addLog("Scaling nodegroup back to original size")
 
@@ -991,23 +1068,6 @@ func (s *SOPService) executeStepWithRetry(stepFn func() error, stepIndex int) er
 
 // continueExecutionFromStep continues execution from a specific step
 func (s *SOPService) continueExecutionFromStep(startStep int) error {
-	defer func() {
-		s.mu.Lock()
-		endTime := time.Now()
-		s.status.EndTime = &endTime
-		if s.status.Status == "Running" {
-			s.status.Status = "Success"
-		}
-		s.mu.Unlock()
-
-		// Mark execution as completed in resilient state
-		if s.stateManager != nil {
-			if err := s.stateManager.CompleteExecution(); err != nil {
-				// Don't log completion failure if state persistence is already disabled
-			}
-		}
-	}()
-
 	steps := []struct {
 		name string
 		fn   func() error
@@ -1018,6 +1078,7 @@ func (s *SOPService) continueExecutionFromStep(startStep int) error {
 		{"Cordon nodes with old relay pods", s.stepCordonNodes},
 		{"Scale nodegroup to 2X current count", s.stepScaleNodeGroup},
 		{"Wait for new nodes to join cluster", s.stepWaitForNewNodes},
+		{"Rollout restart rafay-sentry deployment", s.stepRestartSentryDeployment},
 		{"Scale rafay-relay deployment to 2x", s.stepScaleRelayDeployment},
 		{"Wait for new pods to be running", s.stepWaitForNewPods},
 		{"Delete old pods and scale back deployment", s.stepDeleteOldPods},

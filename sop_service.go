@@ -675,15 +675,44 @@ func (s *SOPService) stepCordonNodes() error {
 }
 
 func (s *SOPService) stepScaleRelayDeployment() error {
-	// Get current replica count
-	currentReplicas, err := s.k8sOps.GetDeploymentReplicas(s.config.Deployment)
+	// First, inspect actual pods to see if there are pending ones
+	pods, err := s.k8sOps.GetRelayPods()
 	if err != nil {
-		return fmt.Errorf("failed to get deployment replicas: %v", err)
+		return fmt.Errorf("failed to get relay pods before scaling deployment: %v", err)
+	}
+
+	var scheduledCount int32
+	var pendingCount int32
+	for _, pod := range pods {
+		if pod.Node == "" || pod.Node == "<none>" {
+			pendingCount++
+		} else {
+			scheduledCount++
+		}
+	}
+
+	var currentReplicas int32
+
+	if pendingCount > 0 && scheduledCount > 0 {
+		// We already have extra pods in Pending; normalize replicas to match scheduled pods
+		s.addLog(fmt.Sprintf("Found %d pending relay pods and %d scheduled pods; normalizing deployment %s to %d replicas before scaling",
+			pendingCount, scheduledCount, s.config.Deployment, scheduledCount))
+
+		if err := s.k8sOps.ScaleDeployment(s.config.Deployment, scheduledCount); err != nil {
+			return fmt.Errorf("failed to normalize deployment replicas before scaling: %v", err)
+		}
+		currentReplicas = scheduledCount
+	} else {
+		// No pending pods (or no scheduled ones) – use the spec replicas as baseline
+		currentReplicas, err = s.k8sOps.GetDeploymentReplicas(s.config.Deployment)
+		if err != nil {
+			return fmt.Errorf("failed to get deployment replicas: %v", err)
+		}
 	}
 
 	newReplicas := currentReplicas * 2
 
-	s.addLog(fmt.Sprintf("Current deployment replicas: %d", currentReplicas))
+	s.addLog(fmt.Sprintf("Current deployment replicas (baseline for scaling): %d", currentReplicas))
 	s.addLog(fmt.Sprintf("Target deployment replicas: %d", newReplicas))
 
 	// Check if already at target replicas (idempotency check)
@@ -693,8 +722,7 @@ func (s *SOPService) stepScaleRelayDeployment() error {
 	}
 
 	// Scale the deployment
-	err = s.k8sOps.ScaleDeployment(s.config.Deployment, newReplicas)
-	if err != nil {
+	if err := s.k8sOps.ScaleDeployment(s.config.Deployment, newReplicas); err != nil {
 		return fmt.Errorf("failed to scale deployment: %v", err)
 	}
 
